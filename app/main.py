@@ -18,6 +18,7 @@ app = FastAPI(
     description=(
         "解析 RFC 9110 Accept-Language（q 权重、q=0 排除、通配符、重复范围），"
         "按 RFC 4647 lookup 逐级截断匹配服务端支持的 BCP 47 标签，"
+        "无可接受候选时可沿 locale_fallbacks 回退链查找受支持语言，"
         "返回选中语言以及每个候选的接受/淘汰轨迹。"
     ),
     version=__version__,
@@ -66,6 +67,7 @@ async def negotiate_language(
         header=payload.accept_language,
         supported=payload.supported_languages,
         default=payload.default_language,
+        locale_fallbacks=payload.locale_fallbacks,
     )
     return NegotiationResponse.model_validate(result)
 

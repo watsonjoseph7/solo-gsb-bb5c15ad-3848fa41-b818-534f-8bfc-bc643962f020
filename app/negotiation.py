@@ -11,6 +11,10 @@ Implements the negotiation rules required by the service:
 * candidates are ranked by the client q weight and ties are broken by the
   stable order of the server-supported list;
 * empty / absent header falls back to the configured default language;
+* optional ``locale_fallbacks`` chains (source tag -> next tag): when no
+  candidate is acceptable, positive-q concrete ranges are tried in weight
+  order (ties by header order) and each chain is walked hop by hop to the
+  first supported language that no ``q=0`` concrete range excludes;
 * malformed header syntax raises :class:`AcceptLanguageError`.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
@@ -182,17 +186,85 @@ def _wildcard_range(ranges: list[LanguageRange]) -> LanguageRange | None:
     return None
 
 
+def _resolve_locale_fallback(
+    locale_fallbacks: dict[str, str],
+    parsed: list[LanguageRange],
+    supported: list[str],
+    candidates: list[dict[str, Any]],
+) -> tuple[int, dict[str, Any]] | None:
+    """Walk locale-fallback chains when standard lookup found nothing.
+
+    Positive-q concrete ranges are tried as chain sources in descending
+    weight order (ties broken by header position). Each chain is followed
+    hop by hop; the first hop that is a supported language wins, unless a
+    ``q=0`` concrete range excludes that candidate — such hops are skipped
+    and the walk continues. Returns ``(supported_index, report)`` where the
+    report carries the triggering source range, the actual path and the
+    resolved server tag, or ``None`` when no chain resolves.
+    """
+
+    graph = {
+        source.lower(): target.lower()
+        for source, target in locale_fallbacks.items()
+    }
+    supported_by_lower = {
+        tag.lower(): (index, tag) for index, tag in enumerate(supported)
+    }
+    sources = sorted(
+        (entry for entry in parsed if entry.range != "*" and entry.q > 0),
+        key=lambda entry: (-entry.q, entry.position),
+    )
+    for entry in sources:
+        start = entry.range
+        if start not in graph:
+            continue
+        path = [start]
+        node = start
+        seen = {start}
+        while node in graph:
+            node = graph[node]
+            if node in seen:
+                # Cycles are rejected during request validation; this guard
+                # only protects direct callers of negotiate().
+                break  # pragma: no cover - defensive
+            seen.add(node)
+            hit = supported_by_lower.get(node)
+            if hit is None:
+                path.append(node)
+                continue
+            index, original = hit
+            candidate = candidates[index]
+            if (
+                candidate["status"] == "excluded"
+                and candidate["matched_range"] != "*"
+            ):
+                # Excluded by a q=0 concrete range: never selectable via
+                # fallback, but the chain may continue past it.
+                path.append(original)
+                continue
+            path.append(original)
+            return index, {
+                "source_range": start,
+                "path": path,
+                "resolved_tag": original,
+            }
+    return None
+
+
 def negotiate(
     header: str | None,
     supported: list[str],
     default: str,
+    locale_fallbacks: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run the full negotiation and build the explanation payload.
 
     Parameters mirror the API request: ``header`` is the raw
     Accept-Language value, ``supported`` the server-supported BCP 47 tags
     in priority order, ``default`` the fallback tag (must be in
-    ``supported``).
+    ``supported``), and ``locale_fallbacks`` an optional mapping of
+    source tag -> next tag consulted only when standard lookup finds no
+    acceptable candidate.
     """
 
     parsed = parse_accept_language(header)
@@ -286,6 +358,7 @@ def negotiate(
 
     eligible = [c for c in candidates if c["status"] == "eligible"]
     selected_index: int | None = None
+    locale_fallback_report: dict[str, Any] | None = None
     if eligible:
         # Highest client weight first; server list order breaks ties
         # (min() keeps the earliest supported_index among equal q).
@@ -293,6 +366,18 @@ def negotiate(
         selected_index = winner["supported_index"]
         winner["status"] = "selected"
         winner["detail"] = "在所有可接受候选中权重最高（同权重按服务端列表顺序最早）"
+    elif locale_fallbacks:
+        resolved = _resolve_locale_fallback(
+            locale_fallbacks, parsed, supported, candidates
+        )
+        if resolved is not None:
+            selected_index, locale_fallback_report = resolved
+            winner = candidates[selected_index]
+            winner["status"] = "selected"
+            winner["detail"] = (
+                "标准 lookup 无可接受候选，经 locale_fallbacks 链自范围 "
+                f"{locale_fallback_report['source_range']!r} 回退选中"
+            )
 
     used_fallback = selected_index is None
     if used_fallback:
@@ -311,6 +396,12 @@ def negotiate(
         default_report = candidates[selected_index]
         if default_report["status"] == "excluded":
             message += "；注意默认语言本身被客户端 q=0 显式排除"
+    elif locale_fallback_report is not None:
+        reason = None
+        message = (
+            "标准 lookup 没有可接受候选，已沿 locale_fallbacks 链自范围 "
+            f"{locale_fallback_report['source_range']!r} 回退选中受支持语言"
+        )
     else:
         reason = None
         message = "已按客户端权重选出最佳语言"
@@ -321,6 +412,7 @@ def negotiate(
         "fallback": used_fallback,
         "fallback_reason": reason,
         "message": message,
+        "locale_fallback": locale_fallback_report,
         "parsed_ranges": [entry.to_dict() for entry in parsed],
         "ignored_duplicates": ignored_duplicates,
         "candidates": candidates,

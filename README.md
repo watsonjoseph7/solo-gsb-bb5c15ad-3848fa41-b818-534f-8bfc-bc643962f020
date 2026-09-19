@@ -3,7 +3,8 @@
 供国际化网关调用的语言协商微服务：接收客户端 `Accept-Language` 头、服务端支持的
 BCP 47 语言标签列表与默认语言，依据 RFC 9110 权重规则与 RFC 4647 lookup 逐级截断
 匹配，选出最终语言，并返回**每一个候选标签的接受 / 淘汰轨迹**，方便网关侧排障与
-可观测。
+可观测。可选的 `locale_fallbacks` 回退链（源标签 → 下一标签的有向映射）在标准
+lookup 无可接受候选时，沿链查找首个可用的受支持语言。
 
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · Uvicorn，依赖在容器构建时安装。
 
@@ -77,6 +78,7 @@ curl -X POST http://localhost:8000/api/v1/negotiate \
 | `accept_language` | string \| null | 否 | 原始 `Accept-Language` 头；缺失、`null` 或空白串视为“无有效范围” |
 | `supported_languages` | string[] | 是 | 服务端支持的 BCP 47 标签，至少 1 个、不可重复（大小写不敏感）；**顺序即稳定优先级** |
 | `default_language` | string | 是 | 默认语言，必须包含在 `supported_languages` 中（大小写不敏感） |
+| `locale_fallbacks` | object \| null | 否 | 回退链映射：`{"源标签": "下一标签"}`。标准 lookup 无可接受候选时沿链查找受支持语言；校验失败返回 422（见下文规则 8） |
 
 ### 响应要点
 
@@ -84,6 +86,12 @@ curl -X POST http://localhost:8000/api/v1/negotiate \
 - `fallback` / `fallback_reason`：
   - `no-valid-range`：请求头缺失或没有任何有效范围 → 回退默认语言；
   - `no-acceptable-candidate`：头合法但所有候选都被 `q=0` 排除或未命中 → 回退默认语言。
+  - 经 `locale_fallbacks` 链选中时**不视为默认回退**：`fallback=false`、
+    `fallback_reason=null`。
+- `locale_fallback`：链回退的触发信息，未提供 `locale_fallbacks` 或未触发时为 `null`：
+  - `source_range`：触发回退的客户端语言范围（小写）；
+  - `path`：实际回退路径，从源范围到最终标签（途经的受支持节点保持服务端原始大小写）；
+  - `resolved_tag`：最终选中的服务端标签（与 `selected_language` 一致）。
 - `parsed_ranges`：解析出的语言范围（小写、去重后的结果，含位置与 q 值）。
 - `ignored_duplicates`：重复范围中被忽略的后续出现（保留第一次出现）。
 - `candidates[]`：每个候选的完整轨迹：
@@ -111,6 +119,45 @@ curl -X POST http://localhost:8000/api/v1/negotiate \
 7. **回退**：请求头缺失/空白/无有效范围，或没有任何可接受候选时，返回
    `default_language` 并置 `fallback=true`。若默认语言本身被 `q=0` 显式排除，
    `message` 中会额外说明。
+8. **`locale_fallbacks` 回退链**（可选）：仅当标准 lookup 没有任何可接受候选时启用。
+   - 以**正 q 的具体范围**（通配符 `*` 与 `q=0` 范围不参与）为链源，按**权重降序、
+     头部顺序**依次尝试；每个源沿 `源 → 下一标签 → …` 的有向链逐跳查找，首个
+     **受支持**且**未被任一 `q=0` 具体范围排除**的标签即为结果（被排除的受支持跳
+     会被跳过，继续沿链向下找）。
+   - 任一源都无法解析时，退回规则 7 的默认语言回退。
+   - 映射本身在请求校验时检查（均大小写不敏感），以下情况返回 **HTTP 422**：
+     源或目标不是合法 BCP 47 标签；重复源；环路（含自环）；从某源出发沿链
+     **无法到达任何受支持语言**的悬空链。
+
+### `locale_fallbacks` 示例
+
+```bash
+curl -X POST http://localhost:8000/api/v1/negotiate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "accept_language": "zh-HK;q=0.9",
+    "supported_languages": ["en-US", "zh-CN", "zh-TW"],
+    "default_language": "en-US",
+    "locale_fallbacks": {"zh-HK": "zh-MO", "zh-MO": "zh-TW"}
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "selected_language": "zh-TW",
+  "selected_supported_index": 2,
+  "fallback": false,
+  "fallback_reason": null,
+  "message": "标准 lookup 没有可接受候选，已沿 locale_fallbacks 链自范围 'zh-hk' 回退选中受支持语言",
+  "locale_fallback": {
+    "source_range": "zh-hk",
+    "path": ["zh-hk", "zh-mo", "zh-TW"],
+    "resolved_tag": "zh-TW"
+  }
+}
+```
 
 ### 422 错误示例
 
@@ -132,8 +179,8 @@ curl -i -X POST http://localhost:8000/api/v1/negotiate \
 }
 ```
 
-请求体自身的 Pydantic 校验错误（如默认语言不在支持列表、标签重复/非法、字段缺失）
-同样返回标准 422 结构。
+请求体自身的 Pydantic 校验错误（如默认语言不在支持列表、标签重复/非法、字段缺失，
+以及 `locale_fallbacks` 的重复源、非法标签、环路、悬空链）同样返回标准 422 结构。
 
 ## 配置
 
@@ -163,7 +210,7 @@ docker run --rm -p 8000:8000 -e UVICORN_WORKERS=2 language-negotiator
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest -q          # 40 个单元/接口测试
+pytest -q          # 66 个单元/接口测试
 ```
 
 ## 项目结构

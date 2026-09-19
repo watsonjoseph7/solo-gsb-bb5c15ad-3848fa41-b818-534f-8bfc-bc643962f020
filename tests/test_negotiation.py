@@ -178,3 +178,144 @@ class TestNegotiate:
         result = negotiate("*", self.SUPPORTED, self.DEFAULT)
         assert result["selected_language"] == "en-US"
         assert result["fallback"] is False
+
+
+class TestLocaleFallback:
+    SUPPORTED = ["en-US", "zh-CN", "zh-TW", "ja-JP"]
+    DEFAULT = "en-US"
+
+    def test_chain_resolves_when_no_acceptable_candidate(self):
+        result = negotiate(
+            "zh-HK;q=0.9",
+            self.SUPPORTED,
+            self.DEFAULT,
+            locale_fallbacks={"zh-HK": "zh-TW"},
+        )
+        assert result["selected_language"] == "zh-TW"
+        assert result["selected_supported_index"] == 2
+        assert result["fallback"] is False
+        assert result["fallback_reason"] is None
+        report = result["locale_fallback"]
+        assert report["source_range"] == "zh-hk"
+        assert report["path"] == ["zh-hk", "zh-TW"]
+        assert report["resolved_tag"] == "zh-TW"
+        zh_tw = next(c for c in result["candidates"] if c["tag"] == "zh-TW")
+        assert zh_tw["status"] == "selected"
+
+    def test_multi_hop_path_passes_through_unsupported_tags(self):
+        result = negotiate(
+            "zh-HK;q=0.9",
+            self.SUPPORTED,
+            self.DEFAULT,
+            locale_fallbacks={"zh-HK": "zh-MO", "zh-MO": "zh-TW"},
+        )
+        assert result["selected_language"] == "zh-TW"
+        assert result["locale_fallback"]["path"] == ["zh-hk", "zh-mo", "zh-TW"]
+
+    def test_first_supported_hop_wins(self):
+        result = negotiate(
+            "zh-HK;q=0.9",
+            self.SUPPORTED,
+            self.DEFAULT,
+            locale_fallbacks={
+                "zh-HK": "zh-MO",
+                "zh-MO": "zh-TW",
+                "zh-TW": "zh-CN",
+            },
+        )
+        assert result["selected_language"] == "zh-TW"
+        assert result["locale_fallback"]["path"] == ["zh-hk", "zh-mo", "zh-TW"]
+
+    def test_sources_ordered_by_weight_then_header_order(self):
+        # Higher q wins even when it appears later in the header.
+        result = negotiate(
+            "de;q=0.5,fr;q=0.8",
+            self.SUPPORTED,
+            self.DEFAULT,
+            locale_fallbacks={"de": "zh-CN", "fr": "ja-JP"},
+        )
+        assert result["selected_language"] == "ja-JP"
+        assert result["locale_fallback"]["source_range"] == "fr"
+        # Equal weights: header order decides.
+        result = negotiate(
+            "de;q=0.5,fr;q=0.5",
+            self.SUPPORTED,
+            self.DEFAULT,
+            locale_fallbacks={"de": "zh-CN", "fr": "ja-JP"},
+        )
+        assert result["selected_language"] == "zh-CN"
+        assert result["locale_fallback"]["source_range"] == "de"
+
+    def test_q_zero_concrete_range_blocks_fallback_target(self):
+        result = negotiate(
+            "zh-HK;q=0.9,zh-TW;q=0",
+            self.SUPPORTED,
+            self.DEFAULT,
+            locale_fallbacks={"zh-HK": "zh-TW"},
+        )
+        # zh-TW is excluded by a q=0 concrete range -> chain yields nothing.
+        assert result["selected_language"] == "en-US"
+        assert result["fallback"] is True
+        assert result["fallback_reason"] == "no-acceptable-candidate"
+        assert result["locale_fallback"] is None
+
+    def test_excluded_hop_skipped_and_chain_continues(self):
+        result = negotiate(
+            "zh-HK;q=0.9,zh-CN;q=0",
+            ["zh-CN", "zh-TW"],
+            "zh-CN",
+            locale_fallbacks={"zh-HK": "zh-CN", "zh-CN": "zh-TW"},
+        )
+        # zh-CN is excluded by q=0; the walk continues to zh-TW.
+        assert result["selected_language"] == "zh-TW"
+        assert result["locale_fallback"]["path"] == ["zh-hk", "zh-CN", "zh-TW"]
+
+    def test_next_source_tried_when_chain_dead_ends_on_excluded(self):
+        result = negotiate(
+            "zh-HK;q=0.9,fr;q=0.8,zh-TW;q=0",
+            self.SUPPORTED,
+            self.DEFAULT,
+            locale_fallbacks={"zh-HK": "zh-TW", "fr": "zh-CN"},
+        )
+        # zh-hk chain ends at excluded zh-TW; fr chain resolves to zh-CN.
+        assert result["selected_language"] == "zh-CN"
+        assert result["locale_fallback"]["source_range"] == "fr"
+        assert result["locale_fallback"]["path"] == ["fr", "zh-CN"]
+
+    def test_q_zero_range_and_wildcard_are_not_sources(self):
+        result = negotiate(
+            "zh-HK;q=0",
+            self.SUPPORTED,
+            self.DEFAULT,
+            locale_fallbacks={"zh-HK": "zh-TW"},
+        )
+        assert result["selected_language"] == "en-US"
+        assert result["fallback"] is True
+        assert result["locale_fallback"] is None
+
+    def test_standard_match_wins_and_chain_is_not_consulted(self):
+        result = negotiate(
+            "zh-TW;q=0.9",
+            self.SUPPORTED,
+            self.DEFAULT,
+            locale_fallbacks={"zh-TW": "zh-CN"},
+        )
+        assert result["selected_language"] == "zh-TW"
+        assert result["locale_fallback"] is None
+
+    def test_no_locale_fallbacks_keeps_existing_behavior(self):
+        result = negotiate("zh-HK;q=0.9", self.SUPPORTED, self.DEFAULT)
+        assert result["selected_language"] == "en-US"
+        assert result["fallback"] is True
+        assert result["locale_fallback"] is None
+
+    def test_missing_header_ignores_chains(self):
+        result = negotiate(
+            None,
+            self.SUPPORTED,
+            self.DEFAULT,
+            locale_fallbacks={"zh-HK": "zh-TW"},
+        )
+        assert result["selected_language"] == "en-US"
+        assert result["fallback_reason"] == "no-valid-range"
+        assert result["locale_fallback"] is None
