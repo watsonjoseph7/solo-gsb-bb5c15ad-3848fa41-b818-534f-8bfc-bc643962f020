@@ -4,9 +4,12 @@ import pytest
 
 from app.negotiation import (
     AcceptLanguageError,
+    LocaleFallbackError,
     negotiate,
+    normalize_fallbacks,
     parse_accept_language,
     truncation_chain,
+    validate_fallback_chains,
 )
 
 
@@ -178,3 +181,182 @@ class TestNegotiate:
         result = negotiate("*", self.SUPPORTED, self.DEFAULT)
         assert result["selected_language"] == "en-US"
         assert result["fallback"] is False
+
+
+class TestFallbackValidation:
+    def test_normalize_lowercases_and_accepts_valid(self):
+        assert normalize_fallbacks({"DE": "EN-gb", "en-gb": "en"}) == {
+            "de": "en-gb",
+            "en-gb": "en",
+        }
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            [("de", "en")],  # not a mapping
+            {"de": "en", "DE": "fr"},  # duplicate source case-insensitive
+            {"12345": "en"},  # bad source tag
+            {"de": "not a tag"},  # bad target tag
+        ],
+    )
+    def test_normalize_rejects_bad_shape(self, raw):
+        with pytest.raises(LocaleFallbackError):
+            normalize_fallbacks(raw)
+
+    def test_chain_reaching_supported_is_valid(self):
+        validate_fallback_chains(
+            {"de": "gsw", "gsw": "zh-cn"}, ["zh-CN", "en-US"]
+        )
+
+    def test_dangling_chain_rejected(self):
+        with pytest.raises(LocaleFallbackError, match="悬空"):
+            validate_fallback_chains({"de": "gsw"}, ["zh-CN"])
+
+    def test_cycle_rejected(self):
+        with pytest.raises(LocaleFallbackError, match="环路"):
+            validate_fallback_chains(
+                {"de": "fr", "fr": "it", "it": "fr"}, ["zh-CN"]
+            )
+
+    def test_self_loop_before_supported_rejected(self):
+        with pytest.raises(LocaleFallbackError, match="环路"):
+            validate_fallback_chains({"de": "de"}, ["zh-CN"])
+
+    def test_self_loop_on_supported_tag_ok(self):
+        validate_fallback_chains({"en": "en", "de": "en"}, ["en"])
+
+
+class TestLocaleChainFallback:
+    SUPPORTED = ["en-US", "zh-CN", "zh-TW", "ja-JP"]
+    DEFAULT = "en-US"
+
+    def test_chain_walked_from_positive_q_range(self):
+        result = negotiate(
+            "gsw;q=0.9",
+            self.SUPPORTED,
+            self.DEFAULT,
+            {"gsw": "de", "de": "zh-CN"},
+        )
+        assert result["selected_language"] == "zh-CN"
+        assert result["fallback"] is False
+        report = result["locale_fallback"]
+        assert report["triggered"] is True
+        assert report["source_range"] == "gsw"
+        assert report["source_q"] == 0.9
+        assert report["source_position"] == 1
+        assert report["path"] == ["gsw", "de", "zh-cn"]
+        assert report["selected_language"] == "zh-CN"
+        winner = next(
+            c for c in result["candidates"] if c["tag"] == "zh-CN"
+        )
+        assert winner["status"] == "selected"
+
+    def test_sources_ordered_by_descending_q(self):
+        # Both ranges miss; de (higher q) is tried first even though fr
+        # appears earlier in the header.
+        result = negotiate(
+            "fr;q=0.3,de;q=0.9",
+            self.SUPPORTED,
+            self.DEFAULT,
+            {"de": "zh-TW", "fr": "ja-JP"},
+        )
+        assert result["selected_language"] == "zh-TW"
+        assert result["locale_fallback"]["source_range"] == "de"
+
+    def test_equal_q_breaks_by_header_order(self):
+        result = negotiate(
+            "fr;q=0.5,de;q=0.5",
+            self.SUPPORTED,
+            self.DEFAULT,
+            {"de": "zh-TW", "fr": "ja-JP"},
+        )
+        assert result["selected_language"] == "ja-JP"
+        assert result["locale_fallback"]["source_range"] == "fr"
+
+    def test_q_zero_supported_node_skipped_walk_continues(self):
+        result = negotiate(
+            "de,zh-tw;q=0",
+            self.SUPPORTED,
+            self.DEFAULT,
+            {"de": "zh-TW", "zh-tw": "zh-CN"},
+        )
+        assert result["selected_language"] == "zh-CN"
+        assert result["locale_fallback"]["path"] == [
+            "de",
+            "zh-tw",
+            "zh-cn",
+        ]
+
+    def test_q_zero_prefix_excludes_supported_node(self):
+        # zh;q=0 excludes zh-CN via lookup prefix as well.
+        result = negotiate(
+            "de,zh;q=0",
+            self.SUPPORTED,
+            self.DEFAULT,
+            {"de": "zh-CN", "zh-cn": "ja-JP"},
+        )
+        assert result["selected_language"] == "ja-JP"
+        assert result["locale_fallback"]["path"] == [
+            "de",
+            "zh-cn",
+            "ja-jp",
+        ]
+
+    def test_wildcard_q_zero_does_not_block_chain(self):
+        # Only concrete q=0 ranges disqualify chain candidates.
+        result = negotiate(
+            "de,*;q=0",
+            self.SUPPORTED,
+            self.DEFAULT,
+            {"de": "zh-CN"},
+        )
+        assert result["selected_language"] == "zh-CN"
+        assert result["locale_fallback"]["path"] == ["de", "zh-cn"]
+
+    def test_q_zero_range_never_starts_a_chain(self):
+        result = negotiate(
+            "de;q=0,fr;q=0.5",
+            self.SUPPORTED,
+            self.DEFAULT,
+            {"de": "zh-CN", "fr": "ja-JP"},
+        )
+        assert result["selected_language"] == "ja-JP"
+        assert result["locale_fallback"]["source_range"] == "fr"
+
+    def test_dead_end_source_then_next_source_tried(self):
+        result = negotiate(
+            "de,ja-jp;q=0,fr",
+            self.SUPPORTED,
+            self.DEFAULT,
+            {"de": "ja-JP", "ja-jp": "ko", "fr": "zh-CN"},
+        )
+        assert result["selected_language"] == "zh-CN"
+        assert result["locale_fallback"]["source_range"] == "fr"
+
+    def test_chains_not_consulted_when_standard_lookup_eligible(self):
+        result = negotiate(
+            "en;q=0.1,*;q=0.05",
+            self.SUPPORTED,
+            self.DEFAULT,
+            {"zz": "zh-TW"},
+        )
+        assert result["selected_language"] == "en-US"
+        assert result["locale_fallback"] is None
+
+    def test_no_reachable_chain_falls_back_to_default(self):
+        result = negotiate(
+            "de;q=0",
+            self.SUPPORTED,
+            self.DEFAULT,
+            {"de": "zh-CN"},
+        )
+        assert result["selected_language"] == "en-US"
+        assert result["fallback"] is True
+        assert result["fallback_reason"] == "no-acceptable-candidate"
+        assert result["locale_fallback"] is None
+        assert "locale_fallbacks" in result["message"]
+
+    def test_without_fallbacks_key_behavior_unchanged(self):
+        result = negotiate("de", self.SUPPORTED, self.DEFAULT)
+        assert "locale_fallback" in result
+        assert result["locale_fallback"] is None

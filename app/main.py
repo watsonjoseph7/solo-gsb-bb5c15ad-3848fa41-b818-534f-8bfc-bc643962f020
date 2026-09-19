@@ -12,12 +12,12 @@ from .schemas import (
     NegotiationRequest,
     NegotiationResponse,
 )
-
 app = FastAPI(
     title="HTTP 语言协商解释 API",
     description=(
         "解析 RFC 9110 Accept-Language（q 权重、q=0 排除、通配符、重复范围），"
         "按 RFC 4647 lookup 逐级截断匹配服务端支持的 BCP 47 标签，"
+        "标准 lookup 无可用候选时可沿可选的 locale_fallbacks 有向链回退，"
         "返回选中语言以及每个候选的接受/淘汰轨迹。"
     ),
     version=__version__,
@@ -61,13 +61,21 @@ async def health() -> HealthResponse:
 )
 async def negotiate_language(
     payload: NegotiationRequest,
-) -> NegotiationResponse:
+) -> JSONResponse:
     result = negotiate(
         header=payload.accept_language,
         supported=payload.supported_languages,
         default=payload.default_language,
+        locale_fallbacks=payload.locale_fallbacks,
     )
-    return NegotiationResponse.model_validate(result)
+    response = NegotiationResponse.model_validate(result)
+    if response.locale_fallback is None:
+        # Drop rather than emit null: when locale_fallbacks did not
+        # participate the response keeps the exact pre-feature key set.
+        payload_body = response.model_dump(exclude={"locale_fallback"})
+    else:
+        payload_body = response.model_dump()
+    return JSONResponse(content=payload_body)
 
 
 @app.get("/", tags=["元信息"])

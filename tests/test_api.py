@@ -148,3 +148,134 @@ def test_wildcard_and_duplicates():
     assert body["ignored_duplicates"] == [
         {"range": "en", "position": 3}
     ]
+
+
+def test_locale_fallback_chain_success_omission_rule():
+    response = _post(
+        {
+            "accept_language": "gsw;q=0.9,fr;q=0.5",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "locale_fallbacks": {
+                "gsw": "de",
+                "de": "zh-TW",
+                "fr": "ja-JP",
+            },
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_language"] == "zh-TW"
+    assert body["fallback"] is False
+    assert body["locale_fallback"] == {
+        "triggered": True,
+        "source_range": "gsw",
+        "source_q": 0.9,
+        "source_position": 1,
+        "path": ["gsw", "de", "zh-tw"],
+        "selected_language": "zh-TW",
+    }
+
+
+def test_locale_fallback_key_absent_in_legacy_responses():
+    # Field not provided -> the response shape must stay exactly legacy.
+    response = _post(
+        {
+            "accept_language": "de,*;q=0.05",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+        }
+    )
+    assert response.status_code == 200
+    assert "locale_fallback" not in response.json()
+
+    # Field provided but chain not triggered -> still omitted.
+    response = _post(
+        {
+            "accept_language": "de;q=0",
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "locale_fallbacks": {"de": "zh-CN"},
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["fallback"] is True
+    assert "locale_fallback" not in body
+
+
+def test_locale_fallback_q_zero_concrete_blocks_selection():
+    # zh-TW is reached but excluded by a concrete q=0 prefix range.
+    response = _post(
+        {
+            "accept_language": "de,zh;q=0",
+            "supported_languages": ["zh-TW", "ja-JP"],
+            "default_language": "ja-JP",
+            "locale_fallbacks": {"de": "zh-TW", "zh-TW": "ja-JP"},
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_language"] == "ja-JP"
+    assert body["locale_fallback"]["path"] == ["de", "zh-tw", "ja-jp"]
+
+
+def test_locale_fallback_duplicate_sources_422():
+    response = _post(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "locale_fallbacks": {"DE": "zh-CN", "de": "zh-TW"},
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "locale_fallbacks"]
+    assert "重复" in detail[0]["msg"]
+
+
+def test_locale_fallback_illegal_tag_422():
+    response = _post(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "locale_fallbacks": {"de": "not a tag"},
+        }
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "locale_fallbacks"]
+
+
+def test_locale_fallback_cycle_422():
+    response = _post(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "locale_fallbacks": {"de": "fr", "fr": "de"},
+        }
+    )
+    assert response.status_code == 422
+    assert "环路" in response.json()["detail"][0]["msg"]
+
+
+def test_locale_fallback_dangling_chain_422():
+    response = _post(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "locale_fallbacks": {"de": "xx", "xx": "yy"},
+        }
+    )
+    assert response.status_code == 422
+    assert "悬空" in response.json()["detail"][0]["msg"]
+
+
+def test_locale_fallback_must_be_object_422():
+    response = _post(
+        {
+            "supported_languages": SUPPORTED,
+            "default_language": DEFAULT,
+            "locale_fallbacks": [["de", "fr"]],
+        }
+    )
+    assert response.status_code == 422
